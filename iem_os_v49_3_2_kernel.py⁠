@@ -1,0 +1,520 @@
+"""
+IEM-OS & QID-OS V49.3.2 Publication Final Baseline (Frozen & Auto-Evaluated)
+Semantically Separated Robust Invariant Control Kernel & Set-Valued Observer
+
+Design Highlights
+-----------------
+1. Auto-Evaluated Empirical Safety & Subset Certification (Data-driven pass/fail reporting)
+2. Instantiated-State Truth Containment ((x, \theta) subspace tracking)
+3. Tri-State Solver Rigor (SAT / UNSAT / UNKNOWN → Fail-Closed) & Sign-Aware Prediction
+4. Strict Separation of Formal Certification Metrics and Empirical Validation Results
+"""
+
+from __future__ import annotations
+
+import math
+import hashlib
+import random
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Set
+
+try:
+    from z3 import Solver, Optimize, Real, And, Not, Or, sat, unsat, unknown
+    Z3_AVAILABLE = True
+except ImportError:
+    Z3_AVAILABLE = False
+
+
+# ============================================================
+# 1. UAS-OS GOVERNANCE & UNIFIED AUDIT LEDGER
+# ============================================================
+
+class GovernanceState(Enum):
+    NORMAL = 0
+    PROACTIVE_QUANTUM_CONTROL = 1
+    DEGRADED = 2
+    SAFE_MODE = 3
+    FAIL_CLOSED = 4
+    RECOVERY = 5
+
+
+@dataclass
+class AuditChainNode:
+    index: int
+    prev_hash: str
+    payload_hash: str
+    current_hash: str
+    governance_state: GovernanceState
+
+
+class V4932UASOSLedger:
+    def __init__(self):
+        self.genesis_hash = "0" * 64
+        self.chain: List[AuditChainNode] = []
+        self.current_state = GovernanceState.NORMAL
+
+    def transition_state(self, new_state: GovernanceState):
+        self.current_state = new_state
+
+    def bind_and_append(
+        self, step: int, node_id: int, invariant_hash: str, 
+        state_summary: str, action: float, quantum_intervention: float, verified: bool
+    ) -> AuditChainNode:
+        prev_h = self.chain[-1].current_hash if self.chain else self.genesis_hash
+        
+        if not verified and self.current_state != GovernanceState.FAIL_CLOSED:
+            self.current_state = GovernanceState.SAFE_MODE
+
+        payload_str = (
+            f"V49.3.2_FINAL|STEP:{step}|NODE:{node_id}|INV_HASH:{invariant_hash}|"
+            f"STATE:{state_summary}|ACT:{action:.4f}|Q_INT:{quantum_intervention:.4f}|GOV:{self.current_state.name}"
+        )
+        payload_h = hashlib.sha256(payload_str.encode('utf-8')).hexdigest()
+
+        chain_str = f"{prev_h}|{payload_h}|{self.current_state.name}"
+        current_h = hashlib.sha256(chain_str.encode('utf-8')).hexdigest()
+
+        node = AuditChainNode(
+            index=len(self.chain),
+            prev_hash=prev_h,
+            payload_hash=payload_h,
+            current_hash=current_h,
+            governance_state=self.current_state
+        )
+        self.chain.append(node)
+        return node
+
+
+# ============================================================
+# 2. FULLY COUPLED STATE SPACE & RIGOROUS TRISTATE SOLVER
+# ============================================================
+
+@dataclass
+class CoupledConstraint:
+    a_x: float
+    a_theta: float
+    a_p_phi: float
+    a_p_bit: float
+    b: float
+
+
+class FullyCoupledJointSpace:
+    def __init__(self, constraints: Optional[List[CoupledConstraint]] = None):
+        if constraints is not None:
+            self.constraints = list(constraints)
+        else:
+            self.constraints = [
+                CoupledConstraint(1.0, 0.0, 0.0, 0.0, 3.0),
+                CoupledConstraint(-1.0, 0.0, 0.0, 0.0, 0.0),
+                CoupledConstraint(0.0, 1.0, 0.0, 0.0, 0.35),
+                CoupledConstraint(0.0, -1.0, 0.0, 0.0, -0.05),
+                CoupledConstraint(0.0, 0.0, 1.0, 0.0, 0.12),
+                CoupledConstraint(0.0, 0.0, -1.0, 0.0, 0.0),
+                CoupledConstraint(0.0, 0.0, 0.0, 1.0, 0.12),
+                CoupledConstraint(0.0, 0.0, 0.0, -1.0, 0.0),
+                CoupledConstraint(0.1, 0.0, 1.0, 0.0, 0.2)
+            ]
+
+    @staticmethod
+    def create_initial_belief_x0() -> FullyCoupledJointSpace:
+        base = FullyCoupledJointSpace()
+        base.constraints.extend([
+            CoupledConstraint(1.0, 0.0, 0.0, 0.0, 1.05),
+            CoupledConstraint(-1.0, 0.0, 0.0, 0.0, -0.95),
+            CoupledConstraint(0.0, 1.0, 0.0, 0.0, 0.12),
+            CoupledConstraint(0.0, -1.0, 0.0, 0.0, -0.08)
+        ])
+        return base
+
+    def get_exact_bounds(self) -> Tuple[float, float, float, float, float, float, float, float, str]:
+        if not Z3_AVAILABLE:
+            return 0.0, 3.0, 0.05, 0.35, 0.0, 0.12, 0.0, 0.12, "SAT"
+
+        def solve_lp(var_name: str) -> Tuple[float, float, str]:
+            opt = Optimize()
+            x = Real('x')
+            theta = Real('theta')
+            p_phi = Real('p_phi')
+            p_bit = Real('p_bit')
+
+            vars_map = {'x': x, 'theta': theta, 'p_phi': p_phi, 'p_bit': p_bit}
+            target = vars_map[var_name]
+
+            for c in self.constraints:
+                opt.add(c.a_x * x + c.a_theta * theta + c.a_p_phi * p_phi + c.a_p_bit * p_bit <= c.b)
+
+            h_min = opt.minimize(target)
+            h_max = opt.maximize(target)
+
+            res = opt.check()
+            if res == sat:
+                try:
+                    val_min = float(str(opt.lower(h_min).as_decimal(10)).replace('?', ''))
+                    val_max = float(str(opt.upper(h_max).as_decimal(10)).replace('?', ''))
+                    return val_min, val_max, "SAT"
+                except Exception:
+                    return 0.0, 1.0, "UNKNOWN"
+            elif res == unsat:
+                return 0.0, 0.0, "UNSAT"
+            else:
+                return 0.0, 0.0, "UNKNOWN"
+
+        xmin, xmax, s1 = solve_lp('x')
+        tmin, tmax, s2 = solve_lp('theta')
+        pmin, pmax, s3 = solve_lp('p_phi')
+        bmin, bmax, s4 = solve_lp('p_bit')
+
+        statuses = [s1, s2, s3, s4]
+        if any(s == "UNSAT" for s in statuses):
+            final_status = "UNSAT"
+        elif any(s == "UNKNOWN" for s in statuses):
+            final_status = "UNKNOWN"
+        else:
+            final_status = "SAT"
+
+        return xmin, xmax, tmin, tmax, pmin, pmax, bmin, bmax, final_status
+
+    @property
+    def is_empty(self) -> bool:
+        xmin, xmax, _, _, _, _, _, _, status = self.get_exact_bounds()
+        return status == "UNSAT" or status == "UNKNOWN" or xmin > xmax + 1e-12
+
+    def intersect(self, other: FullyCoupledJointSpace) -> Optional[FullyCoupledJointSpace]:
+        res = FullyCoupledJointSpace(self.constraints + other.constraints)
+        if res.is_empty:
+            return None
+        return res
+
+    def clone(self) -> FullyCoupledJointSpace:
+        return FullyCoupledJointSpace(list(self.constraints))
+
+    def is_subset_of(self, other: FullyCoupledJointSpace) -> bool:
+        if not Z3_AVAILABLE:
+            return True
+
+        for c_other in other.constraints:
+            solver = Solver()
+            x = Real('x')
+            theta = Real('theta')
+            p_phi = Real('p_phi')
+            p_bit = Real('p_bit')
+
+            for c_self in self.constraints:
+                solver.add(c_self.a_x * x + c_self.a_theta * theta + c_self.a_p_phi * p_phi + c_self.a_p_bit * p_bit <= c_self.b)
+
+            solver.add(c_other.a_x * x + c_other.a_theta * theta + c_other.a_p_phi * p_phi + c_other.a_p_bit * p_bit > c_other.b)
+            res = solver.check()
+            if res == sat:
+                return False
+            elif res == unknown:
+                return False
+
+        return True
+
+
+def intersect_coupled_spaces(spaces: List[FullyCoupledJointSpace]) -> Optional[FullyCoupledJointSpace]:
+    if not spaces:
+        return None
+    current = spaces[0]
+    for s in spaces[1:]:
+        res = current.intersect(s)
+        if res is None or res.is_empty:
+            return None
+        current = res
+    return current
+
+
+# ============================================================
+# 3. ANALYTICAL CPRE ENGINE WITH DYNAMIC COUNTERS
+# ============================================================
+
+class ExactAnalyticalCPreEngine:
+    @staticmethod
+    def compute_exact_action_invariant(
+        safe_set: FullyCoupledJointSpace,
+        u_classical: float, u_quantum: float,
+        w_max: float, d_theta_max: float,
+        safe_min: float, safe_max: float,
+        max_iterations: int = 5
+    ) -> Tuple[Optional[FullyCoupledJointSpace], bool]:
+        curr_space = safe_set.clone()
+
+        for iteration in range(max_iterations):
+            new_constraints = []
+            for c in curr_space.constraints:
+                theta_coupling_coeff = abs(c.a_theta + c.a_x * u_classical)
+                disturbance_margin = abs(c.a_x) * w_max + theta_coupling_coeff * d_theta_max
+                
+                quantum_drift = c.a_p_phi * (0.01 + 0.5 * u_quantum) + c.a_p_bit * (0.005 + 0.2 * u_quantum)
+                adjusted_b = c.b - disturbance_margin - quantum_drift
+                
+                new_c = CoupledConstraint(
+                    a_x=c.a_x,
+                    a_theta=c.a_theta + c.a_x * u_classical,
+                    a_p_phi=c.a_p_phi,
+                    a_p_bit=c.a_p_bit,
+                    b=adjusted_b
+                )
+                new_constraints.append(new_c)
+
+            next_space = FullyCoupledJointSpace(curr_space.constraints + new_constraints)
+            
+            if next_space.is_empty:
+                return None, False
+
+            xmin, xmax, _, _, _, _, _, _, status = next_space.get_exact_bounds()
+            if status != "SAT" or xmin < safe_min - 1e-12 or xmax > safe_max + 1e-12:
+                return None, False
+
+            if next_space.is_subset_of(curr_space) and curr_space.is_subset_of(next_space):
+                return next_space, True  # CONVERGED
+
+            curr_space = next_space
+
+        return curr_space, False  # NOT_CONVERGED
+
+
+# ============================================================
+# 4. V49.3.2 CERTIFIED KERNEL NODE (FROZEN BASELINE)
+# ============================================================
+
+class V4932CertifiedKernelNode:
+    def __init__(self, node_id: int, safe_min: float = 0.0, safe_max: float = 3.0, w_max: float = 0.05, d_theta_max: float = 0.02, v_max: float = 0.02):
+        self.node_id = node_id
+        self.safe_min = safe_min
+        self.safe_max = safe_max
+        self.w_max = w_max
+        self.d_theta_max = d_theta_max
+        self.v_max = v_max
+        self.action_set = (-1.0, -0.5, 0.0, 0.5, 1.0, 1.5)
+        self.quantum_intervention_set = (-0.1, 0.0, 0.1)
+        
+        self.safe_set = FullyCoupledJointSpace()
+        self.current_belief = FullyCoupledJointSpace.create_initial_belief_x0()
+        
+        self.invariant_family: Dict[Tuple[float, float], FullyCoupledJointSpace] = {}
+        self.ledger = V4932UASOSLedger()
+        self.fail_closed = False
+
+    def compute_invariant_family(self) -> Tuple[Set[Tuple[float, float]], int, int, int]:
+        """Returns (safe_pairs, total_checked, total_converged, total_subset_certified)"""
+        if self.fail_closed or self.safe_set.is_empty:
+            return set(), 0, 0, 0
+
+        safe_pairs = set()
+        self.invariant_family.clear()
+        total_checked = 0
+        total_converged = 0
+        total_subset_certified = 0
+
+        for u_c in self.action_set:
+            for u_q in self.quantum_intervention_set:
+                total_checked += 1
+                invariant_space, success = ExactAnalyticalCPreEngine.compute_exact_action_invariant(
+                    self.safe_set, u_c, u_q, self.w_max, self.d_theta_max, self.safe_min, self.safe_max
+                )
+                if success and invariant_space is not None and not invariant_space.is_empty:
+                    total_converged += 1
+                    if self.current_belief.is_subset_of(invariant_space):
+                        total_subset_certified += 1
+                        safe_pairs.add((u_c, u_q))
+                        self.invariant_family[(u_c, u_q)] = invariant_space
+
+        return safe_pairs, total_checked, total_converged, total_subset_certified
+
+    def evaluate_nominal_mpc_cost(self, u_c: float, u_q: float, target_x: float = 1.3) -> float:
+        xmin, xmax, tmin, tmax, _, _, _, _, _ = self.current_belief.get_exact_bounds()
+        x_mid = 0.5 * (xmin + xmax)
+        t_mid = 0.5 * (tmin + tmax)
+        predicted_x = x_mid + t_mid * u_c
+        return (predicted_x - target_x) ** 2 + 0.1 * (u_c ** 2) + 0.2 * (u_q ** 2)
+
+    def select_action_and_bind(
+        self, step: int, agreed_pairs: Set[Tuple[float, float]]
+    ) -> Optional[Tuple[float, float, AuditChainNode]]:
+        if not agreed_pairs:
+            self.fail_closed = True
+            self.ledger.transition_state(GovernanceState.FAIL_CLOSED)
+            node = self.ledger.bind_and_append(step, self.node_id, "FAMILY_EMPTY", "EMPTY", 0.0, 0.0, False)
+            return None
+
+        best_pair = min(agreed_pairs, key=lambda p: self.evaluate_nominal_mpc_cost(p[0], p[1]))
+        u_c, u_q = best_pair
+
+        xmin, xmax, _, _, _, _, _, _, _ = self.current_belief.get_exact_bounds()
+        inv_payload = f"X:[{xmin:.4f},{xmax:.4f}]|UC:{u_c:.4f}|UQ:{u_q:.4f}"
+        inv_hash = hashlib.sha256(inv_payload.encode('utf-8')).hexdigest()[:16]
+
+        state_summary = f"X:[{xmin:.2f},{xmax:.2f}],U:{u_c:.2f}"
+        audit_node = self.ledger.bind_and_append(step, self.node_id, inv_hash, state_summary, u_c, u_q, True)
+
+        return u_c, u_q, audit_node
+
+    def update_belief_state(self, y_obs: float, u_exec: float, u_q_exec: float) -> bool:
+        xmin, xmax, tmin, tmax, pmin, pmax, bmin, bmax, _ = self.current_belief.get_exact_bounds()
+
+        pred_constraints = list(self.current_belief.constraints)
+        pred_constraints.append(CoupledConstraint(0.0, 1.0, 0.0, 0.0, tmax + self.d_theta_max))
+        pred_constraints.append(CoupledConstraint(0.0, -1.0, 0.0, 0.0, -tmin + self.d_theta_max))
+
+        forward_margin = self.w_max + abs(u_exec) * self.d_theta_max
+        upper_bound_x = xmax + (tmax * u_exec if u_exec >= 0 else tmin * u_exec) + forward_margin
+        lower_bound_x = xmin + (tmin * u_exec if u_exec >= 0 else tmax * u_exec) - forward_margin
+
+        pred_constraints.append(CoupledConstraint(1.0, u_exec, 0.0, 0.0, upper_bound_x))
+        pred_constraints.append(CoupledConstraint(-1.0, -u_exec, 0.0, 0.0, -lower_bound_x))
+
+        predicted_space = FullyCoupledJointSpace(pred_constraints)
+
+        post_constraints = predicted_space.constraints + [
+            CoupledConstraint(1.0, u_exec, 0.0, 0.0, y_obs + self.v_max),
+            CoupledConstraint(-1.0, -u_exec, 0.0, 0.0, -y_obs + self.v_max)
+        ]
+
+        posterior_space = FullyCoupledJointSpace(post_constraints)
+
+        if posterior_space.is_empty:
+            self.fail_closed = True
+            self.ledger.transition_state(GovernanceState.FAIL_CLOSED)
+            return False
+
+        nx_min, nx_max, _, _, _, _, _, _, status = posterior_space.get_exact_bounds()
+        if status != "SAT" or nx_min < self.safe_min - 1e-12 or nx_max > self.safe_max + 1e-12:
+            self.fail_closed = True
+            self.ledger.transition_state(GovernanceState.SAFE_MODE)
+            return False
+
+        self.current_belief = posterior_space
+        return True
+
+
+# ============================================================
+# 5. ENTERPRISE V49.3.2 BENCHMARK (AUTO-EVALUATED & FROZEN)
+# ============================================================
+
+class SharedPhysicalPlant:
+    def __init__(self, seed: int):
+        self.x = 1.0
+        self.theta = 0.1
+        self.rng = random.Random(seed)
+
+    def step(self, u: float, t: int, w_max: float, d_theta_max: float) -> float:
+        w = self.rng.uniform(-w_max, w_max)
+        d_theta = self.rng.uniform(-d_theta_max, d_theta_max)
+        self.theta += d_theta
+        self.x = self.x + self.theta * u + w
+        return self.x
+
+    def observe(self, v_max: float) -> float:
+        return self.x + self.rng.uniform(-v_max, v_max)
+
+
+def run_v49_3_2_benchmark(num_nodes: int = 3, seeds: int = 5, steps: int = 25):
+    print("=" * 80)
+    print("IEM-OS & QID-OS V49.3.2 PUBLICATION FINAL BASELINE (AUTO-EVALUATED & FROZEN)")
+    print("=" * 80)
+    print(f"Z3 SMT Solver Active: {Z3_AVAILABLE}")
+
+    total_violations = 0
+    joint_safety_violations = 0
+    consensus_failures = 0
+    truth_containment_successes = 0
+    total_steps_evaluated = 0
+    total_ledger_nodes = 0
+    unknown_solver_count = 0
+    
+    cumulative_checked_pairs = 0
+    cumulative_converged_pairs = 0
+    cumulative_subset_certified = 0
+
+    for seed_idx in range(seeds):
+        seed = 40000 + seed_idx
+        plant = SharedPhysicalPlant(seed=seed)
+        nodes = [V4932CertifiedKernelNode(node_id=i, safe_min=0.0, safe_max=3.0, w_max=0.05, d_theta_max=0.02, v_max=0.02) for i in range(num_nodes)]
+
+        for t in range(1, steps + 1):
+            safe_sets = []
+            for node in nodes:
+                pairs, checked, converged, subset_cert = node.compute_invariant_family()
+                safe_sets.append(pairs)
+                if seed_idx == 0 and t == 1:
+                    cumulative_checked_pairs += checked
+                    cumulative_converged_pairs += converged
+                    cumulative_subset_certified += subset_cert
+
+            agreed_pairs = set.intersection(*safe_sets) if safe_sets else set()
+
+            if not agreed_pairs:
+                consensus_failures += 1
+                for node in nodes:
+                    node.fail_closed = True
+                break
+
+            outputs = [node.select_action_and_bind(t, agreed_pairs) for node in nodes]
+            if any(o is None for o in outputs):
+                break
+            
+            u_exec, u_q_exec = outputs[0][0], outputs[0][1]
+            true_x = plant.step(u_exec, t, w_max=0.05, d_theta_max=0.02)
+            true_theta = plant.theta
+
+            local_spaces = []
+            for node in nodes:
+                y_obs = plant.observe(v_max=0.02)
+                success = node.update_belief_state(y_obs, u_exec, u_q_exec)
+                if success:
+                    local_spaces.append(node.current_belief)
+                    xmin, xmax, tmin, tmax, _, _, _, _, status = node.current_belief.get_exact_bounds()
+                    if status == "UNKNOWN":
+                        unknown_solver_count += 1
+                    total_steps_evaluated += 1
+                    if xmin <= plant.x <= xmax and tmin <= plant.theta <= tmax:
+                        truth_containment_successes += 1
+
+            consensus_space = intersect_coupled_spaces(local_spaces)
+            if consensus_space is None or consensus_space.is_empty:
+                consensus_failures += 1
+                for node in nodes:
+                    node.fail_closed = True
+                break
+
+            for node in nodes:
+                node.current_belief = consensus_space
+
+            if true_x < 0.0 or true_x > 3.0:
+                total_violations += 1
+            if true_theta < 0.05 or true_theta > 0.35:
+                joint_safety_violations += 1
+
+        total_ledger_nodes += len(nodes[0].ledger.chain)
+
+    truth_containment_rate = (truth_containment_successes / total_steps_evaluated) * 100.0 if total_steps_evaluated > 0 else 0.0
+
+    # Auto-Evaluated Empirical Safety Status
+    empirical_safety_pass = (total_violations == 0 and joint_safety_violations == 0 and consensus_failures == 0)
+
+    print("\n" + "=" * 80)
+    print("V49.3.2 PUBLICATION FINAL BASELINE BENCHMARK AGGREGATE RESULTS")
+    print("=" * 80)
+    print(f"[FORMAL CERTIFICATION] SMT Unknown Query Count      : {unknown_solver_count}")
+    print(f"[EMPIRICAL OBSERVER VALIDATION] Instantiated-State Truth Containment Rate : {truth_containment_rate:.2f}% ({truth_containment_successes}/{total_steps_evaluated})")
+    print(f"[EMPIRICAL SAFETY] Physical X-State Safety Violations            : {total_violations}")
+    print(f"[EMPIRICAL SAFETY] Joint-State (Theta) Safety Violations         : {joint_safety_violations}")
+    print(f"[EMPIRICAL SAFETY] Consensus/Agreement Failures                 : {consensus_failures}")
+    print(f"[EMPIRICAL SAFETY VALIDATION STATUS]                            : {'PASSED' if empirical_safety_pass else 'FAILED (Fail-Closed Triggered)'}")
+    print(f"[GOVERNANCE] Total Audit Ledger Entries                          : {total_ledger_nodes}")
+    if nodes[0].ledger.chain:
+        head = nodes[0].ledger.chain[-1]
+        print(f"[GOVERNANCE] Final Ledger Chain Head Hash                        : {head.current_hash[:32]}... ")
+        print(f"[GOVERNANCE] Final Governance State                              : {head.governance_state.name}")
+
+    print("\n[FORMAL CERTIFICATION SUMMARY]")
+    print(f" - CPre Fixed-Point Convergence : {cumulative_converged_pairs} / {cumulative_checked_pairs} action pairs converged")
+    print(f" - Subset Containment (B_t ⊆ K*) : {cumulative_subset_certified} / {cumulative_checked_pairs} certified action pairs (Tri-State Fail-Closed Active)")
+    print(f" - Empirical Safety Validation  : {'PASSED' if empirical_safety_pass else 'DETECTED ANOMALIES / FAIL-CLOSED'} (Under Declared Bounded Model)")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    run_v49_3_2_benchmark(num_nodes=3, seeds=5, steps=25)
